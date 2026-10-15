@@ -1,0 +1,147 @@
+import http from 'node:http';
+import path from 'node:path';
+import fs from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { createHash, timingSafeEqual } from 'node:crypto';
+
+const ROOT = path.dirname(fileURLToPath(import.meta.url));
+const WORKSPACE = path.join(ROOT, 'workspace', 'projects');
+const STATE_FILE = path.join(ROOT, 'workspace', 'state.json');
+const WEB_FILE = path.join(ROOT, 'web', 'index.html');
+const MAX_BODY = 64_000, MAX_FILE = 200_000, MAX_TOOL_CALLS = 12, TIMEOUT = 90_000;
+const previewServers = new Map();
+await fs.mkdir(WORKSPACE, { recursive: true });
+await fs.mkdir(path.dirname(STATE_FILE), { recursive: true });
+
+async function loadEnv() {
+  try {
+    const contents = await fs.readFile(path.join(ROOT, '.env'), 'utf8');
+    for (const raw of contents.split(/\r?\n/)) {
+      const line = raw.trim(); if (!line || line.startsWith('#')) continue;
+      const i = line.indexOf('='); if (i < 1) continue;
+      const key = line.slice(0, i).trim();
+      const value = line.slice(i + 1).trim().replace(/^(['"])(.*)\1$/, '$2');
+      if (/^[A-Z][A-Z0-9_]*$/.test(key) && process.env[key] === undefined) process.env[key] = value;
+    }
+  } catch (e) { if (e.code !== 'ENOENT') throw e; }
+}
+await loadEnv();
+
+const SYSTEM = `You are JARVIS, a software-building agent. Understand the request, plan briefly, inspect existing project files before edits, implement complete working code, run approved build/test commands, inspect output, repair failures, and report precisely what was verified. Start a local preview for websites. Use reasonable defaults and ask only essential questions. Do not deploy, publish, access files outside the selected project, delete files, or expose credentials. Track requirements, completed work, bugs, and changes with project_state. Browser automation is unavailable; do not claim visual testing.`;
+const tools = [
+  ['select_project','Create or select an isolated project by short name; use an existing name to continue it.',{name:{type:'string'}}],
+  ['list_files','List project files at a relative path.',{path:{type:'string'}}],
+  ['read_file','Read a UTF-8 text file in the selected project.',{path:{type:'string'}}],
+  ['write_file','Create or replace a UTF-8 file in the project (200 KB limit). Never write credentials.',{path:{type:'string'},content:{type:'string'}}],
+  ['scaffold_website','Create a minimal responsive static site when the project is empty.',{name:{type:'string'},description:{type:'string'}}],
+  ['run_command','Run one approved development command: python -m http.server PORT, python -m unittest, python -m compileall, npm install, npm test, npm run build/test/dev/start/preview, or git status/diff/log.',{command:{type:'string'}}],
+  ['start_dev_server','Start a local static preview with python -m http.server PORT or an npm run dev script.',{command:{type:'string'}}],
+  ['project_state','Read/update tracked requirements, completed work, bugs, and recent changes.',{requirements:{type:'array',items:{type:'string'}},completed:{type:'array',items:{type:'string'}},bugs:{type:'array',items:{type:'string'}},changes:{type:'array',items:{type:'string'}}}]
+].map(([name,description,properties])=>({type:'function',function:{name,description,parameters:{type:'object',properties,required:name==='select_project'?['name']:name==='read_file'?['path']:name==='write_file'?['path','content']:name==='scaffold_website'?['name','description']:name==='run_command'||name==='start_dev_server'?['command']:[]}}}));
+
+const isoNow=()=>new Date().toISOString();
+async function readState(){try{return JSON.parse(await fs.readFile(STATE_FILE,'utf8'))}catch{return {current_project:'website',projects:{},tasks:[]}}}
+async function writeState(s){await fs.writeFile(STATE_FILE,JSON.stringify(s,null,2),'utf8')}
+function validName(n){if(typeof n!=='string'||!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,49}$/.test(n))throw Error('Use a project name with letters, numbers, underscores, or hyphens.');return n}
+async function currentName(){const s=await readState();try{return validName(s.current_project||'website')}catch{return 'website'}}
+async function projectDir(name){const n=validName(name||await currentName()),p=path.resolve(WORKSPACE,n);if(!p.startsWith(WORKSPACE+path.sep))throw Error('Project is outside the approved workspace.');await fs.mkdir(p,{recursive:true});return p}
+async function safeFile(rel,{createParent=false}={}){
+  if(typeof rel!=='string'||!rel.trim()||rel.includes('\0')||path.isAbsolute(rel)||rel.split(/[\\/]/).includes('..'))throw Error('Use a relative path inside the current project.');
+  const root=await projectDir(),target=path.resolve(root,rel);if(!target.startsWith(root+path.sep))throw Error('File is outside the selected project.');
+  if(createParent)await fs.mkdir(path.dirname(target),{recursive:true});
+  let parent;try{parent=await fs.realpath(path.dirname(target))}catch(e){if(e.code==='ENOENT')return target;throw e}if(parent!==root&&!parent.startsWith(root+path.sep))throw Error('A symlink points outside the selected project.');
+  try{const real=await fs.realpath(target);if(real!==root&&!real.startsWith(root+path.sep))throw Error('A symlink points outside the selected project.')}catch(e){if(e.code!=='ENOENT')throw e}
+  return target;
+}
+async function listFiles(rel=''){
+  const root=await projectDir(),base=rel?await safeFile(rel):root,files=[];
+  async function walk(dir){let entries;try{entries=await fs.readdir(dir,{withFileTypes:true})}catch{return}for(const ent of entries){if(['.git','node_modules','.venv','__pycache__'].includes(ent.name)||ent.isSymbolicLink())continue;const p=path.join(dir,ent.name);if(ent.isDirectory())await walk(p);else if(ent.isFile()&&files.length<501)files.push(path.relative(root,p).split(path.sep).join('/'))}}
+  try{const st=await fs.stat(base);if(st.isFile())files.push(path.relative(root,base).split(path.sep).join('/'));else await walk(base)}catch(e){if(e.code==='ENOENT')return {files:[],directory_exists:false};throw e}
+  return {files:files.slice(0,500),truncated:files.length>500};
+}
+async function writeTextFile(rel,content){if(typeof content!=='string'||Buffer.byteLength(content)>MAX_FILE)return {error:'Files are limited to 200 KB.'};const p=await safeFile(rel,{createParent:true});await fs.writeFile(p,content,'utf8');return {written:path.relative(await projectDir(),p).split(path.sep).join('/'),bytes:Buffer.byteLength(content)}}
+function commandArgs(command){
+  if(typeof command!=='string'||command.length>1000||/[;&|><`$()\r\n]/.test(command))throw Error('Only one simple approved command is allowed; shell operators are disabled.');
+  const args=command.trim().split(/\s+/);let ok=false;
+  if(['python','python3'].includes(args[0])&&args[1]==='-m'&&['http.server','unittest','compileall'].includes(args[2])&&args.length<=4)ok=true;
+  if(args[0]==='npm'&&((args[1]==='install'&&args.length===2)||(args[1]==='test'&&args.length===2)||(args[1]==='run'&&['build','test','dev','start','preview'].includes(args[2])&&args.length===3)))ok=true;
+  if(args[0]==='git'&&['status','diff','log'].includes(args[1])&&args.length<=2)ok=true;
+  if(!ok)throw Error('Command is not on the approved development-command list.');return args;
+}
+function runCommand(command,{background=false}={}){
+  let args;try{args=commandArgs(command)}catch(e){return Promise.resolve({error:e.message})}
+  const isPreview=background&&((args[0].startsWith('python')&&args[1]==='-m'&&args[2]==='http.server')||(args[0]==='npm'&&args[1]==='run'&&args[2]==='dev'));
+  if(background&&!isPreview)return Promise.resolve({error:'Preview command must be python -m http.server PORT or npm run dev.'});
+  return projectDir().then(cwd=>new Promise(resolve=>{
+    const env={PATH:process.env.PATH||'',HOME:process.env.HOME||'',USERPROFILE:process.env.USERPROFILE||'',SystemRoot:process.env.SystemRoot||'',WINDIR:process.env.WINDIR||'',TEMP:process.env.TEMP||'',TMP:process.env.TMP||'',CI:'1',NO_COLOR:'1'};
+    const win=process.platform==='win32';
+    const child=spawn(args[0],args.slice(1),{cwd,env,shell:win&&args[0]==='npm',windowsHide:true,detached:background,stdio:background?'ignore':['ignore','pipe','pipe']});
+    if(background){const p=Number(args.find(x=>/^\d+$/.test(x)));const port=p>=1024&&p<=65535?p:(args[0]==='npm'?5173:8000);let settled=false;child.once('error',e=>{if(!settled){settled=true;resolve({error:`Could not start server: ${e.message}`})}});setTimeout(()=>{if(settled)return;if(child.exitCode!==null){settled=true;resolve({error:`Server exited with code ${child.exitCode}.`})}else{settled=true;resolve({status:'running',pid:child.pid,url:`http://127.0.0.1:${port}`})}},700);return}
+    let output='',timedOut=false;const append=b=>{output=(output+b.toString()).slice(-12000)};child.stdout?.on('data',append);child.stderr?.on('data',append);
+    const timer=setTimeout(()=>{timedOut=true;child.kill('SIGTERM')},TIMEOUT);child.once('error',e=>{clearTimeout(timer);resolve({error:`Could not run command: ${e.message}`} )});child.once('close',code=>{clearTimeout(timer);resolve({exit_code:code,output,timed_out:timedOut,...(timedOut?{error:`Command exceeded ${TIMEOUT/1000} seconds.`}:{})})});
+  }));
+}
+async function startDevServer(command){
+  const args=commandArgs(command),name=await currentName();
+  if(args[0].startsWith('python')&&args[1]==='-m'&&args[2]==='http.server'){
+    const root=await projectDir(name);try{await fs.access(path.join(root,'index.html'))}catch{return {error:'No index.html found in this project to preview.'}}
+    previewServers.set(name,{mode:'static',root});return {status:'running',mode:'static',url:`/preview/${encodeURIComponent(name)}/`};
+  }
+  if(args[0]==='npm'&&args[1]==='run'&&args[2]==='dev'){
+    const p=await projectDir(name);let port=5173;try{const pkg=JSON.parse(await fs.readFile(path.join(p,'package.json'),'utf8'));const deps={...pkg.dependencies,...pkg.devDependencies};if(deps.next||deps['react-scripts'])port=3000;else if(deps['@angular/cli'])port=4200}catch{}
+    const started=await runCommand(command,{background:true});if(started.error)return started;previewServers.set(name,{mode:'proxy',port});return {status:'running',mode:'dev',url:`/preview/${encodeURIComponent(name)}/`};
+  }
+  return {error:'Preview command must be python -m http.server PORT or npm run dev.'};
+}
+const MIME={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.mjs':'text/javascript; charset=utf-8','.json':'application/json; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.webp':'image/webp','.ico':'image/x-icon','.woff':'font/woff','.woff2':'font/woff2'};
+async function servePreview(req,res,url){
+  const parts=url.pathname.split('/').filter(Boolean);if(parts.length<2||parts[0]!=='preview')return false;
+  let name;try{name=decodeURIComponent(parts[1]);validName(name)}catch{sendJson(res,400,{error:'Invalid preview project.'});return true}
+  const entry=previewServers.get(name);if(!entry){sendJson(res,404,{error:'No preview server is running for this project.'});return true}
+  const suffix=parts.slice(2).map(decodeURIComponent).join('/');
+  if(entry.mode==='static'){
+    try{const rel=suffix||'index.html';if(rel.split('/').some(s=>s.startsWith('.')))throw Error('Hidden files are not served.');const p=await safeFile(rel);const st=await fs.stat(p);if(!st.isFile()||st.size>5_000_000)throw Error('File cannot be previewed.');const body=await fs.readFile(p);res.writeHead(200,{'Content-Type':MIME[path.extname(p).toLowerCase()]||'application/octet-stream','Content-Length':body.length,'X-Content-Type-Options':'nosniff','Cache-Control':'no-store'});res.end(body)}catch(e){sendJson(res,404,{error:e.message||'Preview file not found.'})}return true;
+  }
+  const upstream=http.request({host:'127.0.0.1',port:entry.port,path:'/'+suffix+(url.search||''),method:req.method,headers:{...req.headers,host:`127.0.0.1:${entry.port}`}},up=>{res.writeHead(up.statusCode||502,up.headers);up.pipe(res)});upstream.on('error',()=>sendJson(res,502,{error:'Development server is unavailable.'}));req.pipe(upstream);return true;
+}
+function escapeHtml(s){return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;')}
+async function scaffold(name,description){const d=await projectDir();if((await fs.readdir(d)).length)return {error:'Project is not empty. Inspect it and preserve existing work.'};const title=escapeHtml(String(name).slice(0,100)),desc=escapeHtml(String(description).slice(0,500));
+  await fs.writeFile(path.join(d,'index.html'),`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><link rel="stylesheet" href="style.css"></head><body><main><p>${title}</p><h1>${desc}</h1><button id="start">Get started</button><p id="feedback" aria-live="polite"></p></main><script src="app.js"></script></body></html>`,'utf8');
+  await fs.writeFile(path.join(d,'style.css'),'*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#101827;color:#f8fafc;font:18px system-ui;padding:24px}main{max-width:760px}h1{font-size:clamp(2.5rem,8vw,5rem)}button{border:0;border-radius:999px;padding:14px 24px;background:#67e8f9;color:#0f172a;font-weight:700;cursor:pointer}','utf8');
+  await fs.writeFile(path.join(d,'app.js'),"document.querySelector('#start').addEventListener('click',()=>document.querySelector('#feedback').textContent='Thanks for stopping by!');\n",'utf8');await fs.writeFile(path.join(d,'README.md'),`# ${title}\n\n${desc}\n\nRun python -m http.server 8000 to preview.\n`,'utf8');return {created:['index.html','style.css','app.js','README.md']};
+}
+async function projectState(args){const state=await readState(),n=await currentName(),entry=state.projects??(state.projects={});const item=entry[n]??(entry[n]={requirements:[],completed:[],bugs:[],changes:[]});for(const k of ['requirements','completed','bugs','changes'])if(Array.isArray(args[k]))item[k]=args[k].slice(-100);item.directory=await projectDir(n);item.updated_at=isoNow();await writeState(state);return item}
+async function toolCall(name,args){
+  if(name==='select_project'){const n=validName(args.name),s=await readState();s.current_project=n;s.projects??={};s.projects[n]??={requirements:[],completed:[],bugs:[],changes:[]};await writeState(s);await projectDir(n);return {current_project:n,directory:await projectDir(n),files:await listFiles()}}
+  if(name==='list_files')return listFiles(args.path||'');
+  if(name==='read_file'){const p=await safeFile(args.path),st=await fs.stat(p);if(!st.isFile())return {error:'File not found.'};if(st.size>MAX_FILE)return {error:'File exceeds the 200 KB read limit.'};return {content:await fs.readFile(p,'utf8')}}
+  if(name==='write_file')return writeTextFile(args.path,args.content);
+  if(name==='scaffold_website')return scaffold(args.name,args.description);
+  if(name==='run_command')return runCommand(args.command);
+  if(name==='start_dev_server')return startDevServer(args.command);
+  if(name==='project_state')return projectState(args);
+  return {error:'Unknown tool'};
+}
+async function callModel(messages){const key=process.env.GROQ_API_KEY;if(!key)throw Error('GROQ_API_KEY is not configured in the server environment.');const body={model:process.env.GROQ_MODEL||'llama-3.3-70b-versatile',messages,tools,tool_choice:'auto',temperature:.2};const r=await fetch('https://api.groq.com/openai/v1/chat/completions',{method:'POST',headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(90_000)});const data=await r.json().catch(()=>({}));if(!r.ok)throw Error(`Groq API returned HTTP ${r.status}: ${data.error?.message||'request failed'}`);return data}
+async function agentTurn(prompt){if(typeof prompt!=='string'||!prompt.trim()||prompt.length>12_000)throw Error('Message must contain 1–12,000 characters.');const state=await readState(),n=await currentName();await projectDir(n);const messages=[{role:'system',content:`${SYSTEM}\nCurrent project: ${n}\nDirectory: workspace/projects/${n}\nProject record: ${JSON.stringify(state.projects?.[n]||{})}`},{role:'user',content:prompt}],used=[];
+  for(let i=0;i<MAX_TOOL_CALLS;i++){const data=await callModel(messages),m=data.choices?.[0]?.message;if(!m)throw Error('Model returned an invalid response.');messages.push(m);const calls=m.tool_calls||[];if(!calls.length){const fresh=await readState();fresh.tasks??=[];fresh.tasks.push({at:isoNow(),project:n,request:prompt.slice(0,1000),result:String(m.content||'').slice(0,2000),tools:used.map(x=>x.tool)});fresh.tasks=fresh.tasks.slice(-100);await writeState(fresh);return {answer:m.content||'The model returned no text.',tools:used,project:n,directory:await projectDir(n),state:fresh.projects?.[n]||{}}}
+    for(const c of calls){const fn=c.function||{};let result;try{result=await toolCall(fn.name,JSON.parse(fn.arguments||'{}'))}catch(e){result={error:e.message}}used.push({tool:fn.name,result});messages.push({role:'tool',tool_call_id:c.id,content:JSON.stringify(result).slice(0,14_000)})}}
+  return {answer:'Reached the tool-call limit before finishing. Continue with a follow-up.',tools:used,project:n,directory:await projectDir(n)}
+}
+function sendJson(res,status,data){const body=Buffer.from(JSON.stringify(data));res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Content-Length':body.length,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(body)}
+function authorized(req,res){const expected=process.env.JARVIS_ACCESS_PASSWORD;if(!expected)return true;let supplied='';try{const h=req.headers.authorization||'';if(h.startsWith('Basic '))supplied=Buffer.from(h.slice(6),'base64').toString('utf8').split(':').slice(1).join(':')}catch{}const a=Buffer.from(supplied),b=Buffer.from(expected);if(a.length===b.length&&timingSafeEqual(a,b))return true;res.writeHead(401,{'WWW-Authenticate':'Basic realm="JARVIS", charset="UTF-8"','Cache-Control':'no-store'});res.end('Authentication required');return false}
+const server=http.createServer(async(req,res)=>{try{
+  if(!authorized(req,res))return;const url=new URL(req.url,'http://localhost');
+  if(req.method==='GET'&&url.pathname==='/'){const body=await fs.readFile(WEB_FILE);res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Content-Length':body.length,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(body);return}
+  if(req.method==='GET'&&url.pathname==='/api/status'){sendJson(res,200,{project:await currentName(),model_configured:!!process.env.GROQ_API_KEY,model:process.env.GROQ_MODEL||'llama-3.3-70b-versatile',browser_automation:false});return}
+  if(req.method==='GET'&&url.pathname==='/api/state'){sendJson(res,200,await readState());return}
+  if(req.method==='GET'&&url.pathname.startsWith('/preview/')){if(await servePreview(req,res,url))return}
+  if(req.method==='POST'&&url.pathname==='/api/chat'){let raw='';for await(const chunk of req){raw+=chunk;if(Buffer.byteLength(raw)>MAX_BODY){sendJson(res,413,{error:'Request body exceeds 64 KB.'});return}}let input;try{input=JSON.parse(raw)}catch{sendJson(res,400,{error:'Request must be valid JSON.'});return}if(typeof input.message!=='string'||!input.message.trim()||input.message.length>12_000){sendJson(res,400,{error:'Message must contain 1–12,000 characters.'});return}const result=await agentTurn(input.message);sendJson(res,200,result);return}
+  sendJson(res,404,{error:'Not found'});
+}catch(e){sendJson(res,e.message?.includes('GROQ_API_KEY')?503:500,{error:e.message||'Server error'})}});
+const host=process.env.JARVIS_HOST||'127.0.0.1';const port=Number(process.env.PORT||process.env.JARVIS_PORT||8765);
+if(!['127.0.0.1','localhost','::1','0.0.0.0'].includes(host))throw Error('JARVIS_HOST must be localhost or 0.0.0.0.');
+if(host==='0.0.0.0'&&!process.env.JARVIS_ACCESS_PASSWORD)throw Error('Refusing public binding without JARVIS_ACCESS_PASSWORD.');
+server.listen(port,host,()=>console.log(`JARVIS is listening at http://${host}:${port}`));

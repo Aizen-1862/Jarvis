@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: jarvis-software-agent
+    runtime: node
+    plan: free
+    buildCommand: ""
+    startCommand: node server.mjs
+    autoDeploy: false
+    healthCheckPath: /api/status
+    envVars:
+      - key: JARVIS_HOST
+        value: 0.0.0.0
+      - key: JARVIS_ACCESS_PASSWORD
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: FISH_AUDIO_API_KEY
+        sync: false
+      - key: FISH_AUDIO_MODEL_ID
+        sync: false
