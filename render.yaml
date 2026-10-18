@@ -18,3 +18,13 @@ services:
         sync: false
       - key: FISH_AUDIO_MODEL_ID
         sync: false
+      - key: POLLINATIONS_API_KEY
+        sync: false
+      - key: POLLINATIONS_IMAGE_MODEL
+        value: black-forest-labs/flux.1-schnell
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: ELEVENLABS_VOICE_ID
+        value: 9375G6zswFk7v9bKTVQF
+      - key: ELEVENLABS_MODEL_ID
+        value: eleven_flash_v2_5
